@@ -715,6 +715,79 @@ describe("Project.addSandbox and Project.removeSandbox", () => {
   )
 })
 
+describe("Project.reconcileWorktrees", () => {
+  const norm = (p: string) => (process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p))
+
+  it.live("discovers worktrees created outside opencode into sandboxes", () =>
+    Effect.gen(function* () {
+      const project = yield* Project.Service
+      const tmp = yield* tmpdirScoped({ git: true })
+      const result = yield* project.fromDirectory(tmp)
+
+      const worktreePath = path.join(tmp, "..", path.basename(tmp) + "-external")
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() =>
+          $`git worktree remove ${worktreePath}`
+            .cwd(tmp)
+            .quiet()
+            .catch(() => {}),
+        ),
+      )
+      yield* Effect.promise(() => $`git worktree add ${worktreePath} -b external-${Date.now()}`.cwd(tmp).quiet())
+
+      // Not tracked yet — the create happened entirely outside opencode.
+      const before = yield* project.get(result.project.id)
+      expect(before?.sandboxes.map(norm)).not.toContain(norm(worktreePath))
+
+      yield* project.reconcileWorktrees({ projectID: result.project.id, worktree: tmp, vcs: "git" })
+
+      const after = yield* project.get(result.project.id)
+      expect(after?.sandboxes.map(norm)).toContain(norm(worktreePath))
+      // The primary worktree is never listed as a sandbox.
+      expect(after?.sandboxes.map(norm)).not.toContain(norm(tmp))
+    }),
+  )
+
+  it.live("is idempotent and does not duplicate an already-tracked worktree", () =>
+    Effect.gen(function* () {
+      const project = yield* Project.Service
+      const tmp = yield* tmpdirScoped({ git: true })
+      const result = yield* project.fromDirectory(tmp)
+
+      const worktreePath = path.join(tmp, "..", path.basename(tmp) + "-idem")
+      yield* Effect.addFinalizer(() =>
+        Effect.promise(() =>
+          $`git worktree remove ${worktreePath}`
+            .cwd(tmp)
+            .quiet()
+            .catch(() => {}),
+        ),
+      )
+      yield* Effect.promise(() => $`git worktree add ${worktreePath} -b idem-${Date.now()}`.cwd(tmp).quiet())
+
+      const args = { projectID: result.project.id, worktree: tmp, vcs: "git" as const }
+      yield* project.reconcileWorktrees(args)
+      yield* project.reconcileWorktrees(args)
+
+      const found = yield* project.get(result.project.id)
+      expect(found?.sandboxes.filter((s) => norm(s) === norm(worktreePath))).toHaveLength(1)
+    }),
+  )
+
+  it.live("is a no-op for non-git projects", () =>
+    Effect.gen(function* () {
+      const project = yield* Project.Service
+      const tmp = yield* tmpdirScoped({ git: true })
+      const result = yield* project.fromDirectory(tmp)
+
+      yield* project.reconcileWorktrees({ projectID: result.project.id, worktree: tmp, vcs: undefined })
+
+      const found = yield* project.get(result.project.id)
+      expect(found?.sandboxes ?? []).toHaveLength(0)
+    }),
+  )
+})
+
 describe("Project.fromDirectory with bare repos", () => {
   it.live("worktree from bare repo should cache in bare repo, not parent", () =>
     Effect.gen(function* () {

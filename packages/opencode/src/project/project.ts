@@ -10,9 +10,13 @@ import { GlobalBus } from "@/bus/global"
 import { which } from "@opencode-ai/core/util/which"
 import { Command } from "@/command"
 import { InstanceState } from "@/effect/instance-state"
-import { Effect, Layer, Scope, Context, Stream, Types, Schema } from "effect"
+import type { InstanceContext } from "@/project/instance-context"
+import { Effect, Layer, Scope, Context, Stream, Types, Schema, Path } from "effect"
+import { path } from "@opencode-ai/core/effect/app-node-platform"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Watcher } from "@opencode-ai/core/filesystem/watcher"
+import type ParcelWatcher from "@parcel/watcher"
 import { AppProcess } from "@opencode-ai/core/process"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
@@ -96,7 +100,13 @@ export interface Interface {
   readonly setInitialized: (id: ProjectV2.ID) => Effect.Effect<void>
   readonly sandboxes: (id: ProjectV2.ID) => Effect.Effect<string[]>
   readonly addSandbox: (id: ProjectV2.ID, directory: string) => Effect.Effect<void>
+  readonly mergeSandboxes: (id: ProjectV2.ID, directories: string[]) => Effect.Effect<void>
   readonly removeSandbox: (id: ProjectV2.ID, directory: string) => Effect.Effect<void>
+  readonly reconcileWorktrees: (input: {
+    projectID: ProjectV2.ID
+    worktree: string
+    vcs: Info["vcs"]
+  }) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Project") {}
@@ -112,6 +122,7 @@ const layer = Layer.effect(
     const projectDirectories = yield* ProjectDirectories.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const pathSvc = yield* Path.Path
     const { db } = yield* Database.Service
 
     const git = Effect.fnUntraced(
@@ -383,6 +394,107 @@ const layer = Layer.effect(
         .pipe(Effect.orDie)
     })
 
+    const canonical = Effect.fnUntraced(function* (input: string) {
+      const abs = pathSvc.resolve(input)
+      const real = yield* fs.realPath(abs).pipe(Effect.catch(() => Effect.succeed(abs)))
+      const normalized = pathSvc.normalize(real)
+      return process.platform === "win32" ? normalized.toLowerCase() : normalized
+    })
+
+    function parseWorktreePaths(text: string) {
+      const result: string[] = []
+      for (const raw of text.split("\n")) {
+        const line = raw.trim()
+        if (line.startsWith("worktree ")) result.push(line.slice("worktree ".length).trim())
+      }
+      return result
+    }
+
+    // Merge every git worktree the repo actually has into the project's tracked
+    // sandboxes, so worktrees created outside opencode (e.g. on the CLI) show up
+    // as workspaces. Takes plain primitives so it can run from a watcher callback
+    // or a boot hook without an ambient instance context.
+    const reconcileWorktrees = Effect.fn("Project.reconcileWorktrees")(function* (input: {
+      projectID: ProjectV2.ID
+      worktree: string
+      vcs: Info["vcs"]
+    }) {
+      if (input.vcs !== "git") return
+      const result = yield* git(["worktree", "list", "--porcelain"], { cwd: input.worktree })
+      if (result.code !== 0) return
+      const primary = yield* canonical(input.worktree)
+      const found: string[] = []
+      for (const raw of parseWorktreePaths(result.text)) {
+        const dir = yield* canonical(raw)
+        if (dir !== primary) found.push(dir)
+      }
+      if (found.length === 0) return
+      const existing = yield* sandboxes(input.projectID)
+      const seen = new Set<string>()
+      for (const dir of existing) seen.add(yield* canonical(dir))
+      const missing = found.filter((dir) => !seen.has(dir))
+      if (missing.length === 0) return
+      yield* mergeSandboxes(input.projectID, missing)
+    })
+
+    // Reconcile once on boot, then watch the repo's `.git/worktrees` directory
+    // (git records every worktree there, wherever it lives) so add/remove by any
+    // tool is picked up live. Only the primary worktree instance owns this.
+    const watchWorktrees = Effect.fn("Project.watchWorktrees")(function* (ctx: InstanceContext) {
+      if (ctx.project.vcs !== "git") return
+      const primary = yield* canonical(ctx.project.worktree)
+      if ((yield* canonical(ctx.directory)) !== primary) return
+
+      const reconcileArgs = { projectID: ctx.project.id, worktree: ctx.project.worktree, vcs: ctx.project.vcs }
+      yield* reconcileWorktrees(reconcileArgs).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("worktree reconcile failed", { cause })),
+      )
+
+      const commonDirResult = yield* git(["rev-parse", "--git-common-dir"], { cwd: ctx.project.worktree })
+      if (commonDirResult.code !== 0) return
+      const commonDir = yield* canonical(pathSvc.resolve(ctx.project.worktree, commonDirResult.text.trim()))
+      const worktreesDir = pathSvc.join(commonDir, "worktrees")
+
+      const entries = yield* fs.readDirectoryEntries(commonDir).pipe(Effect.catch(() => Effect.succeed([])))
+      const ignore = entries.flatMap((entry) => (entry.name === "worktrees" ? [] : [entry.name]))
+
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const trigger = () => {
+        if (timer) clearTimeout(timer)
+        timer = setTimeout(() => {
+          timer = undefined
+          Effect.runFork(
+            reconcileWorktrees(reconcileArgs).pipe(
+              Effect.catchCause((cause) => Effect.logWarning("worktree reconcile failed", { cause })),
+            ),
+          )
+        }, 200)
+      }
+
+      const callback: ParcelWatcher.SubscribeCallback = (_error, updates) => {
+        for (const update of updates) {
+          if (update.path === worktreesDir || update.path.startsWith(`${worktreesDir}${pathSvc.sep}`)) {
+            trigger()
+            return
+          }
+        }
+      }
+
+      const pending = Watcher.watchDirectory(commonDir, callback, { ignore })
+      if (pending) {
+        const subscription = yield* Effect.promise(() => pending).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (subscription)
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(() => subscription.unsubscribe()).pipe(Effect.catch(() => Effect.void)),
+          )
+      }
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          if (timer) clearTimeout(timer)
+        }),
+      )
+    })
+
     const initState = yield* InstanceState.make(
       Effect.fn("Project.initState")(function* (ctx) {
         const unsubscribe = yield* events.listen((event) => {
@@ -392,6 +504,10 @@ const layer = Layer.effect(
           return data.name === Command.Default.INIT ? setInitialized(ctx.project.id) : Effect.void
         })
         yield* Effect.addFinalizer(() => unsubscribe)
+
+        yield* watchWorktrees(ctx).pipe(
+          Effect.catchCause((cause) => Effect.logWarning("worktree watch setup failed", { cause })),
+        )
       }),
     )
 
@@ -431,6 +547,31 @@ const layer = Layer.effect(
       yield* emitUpdated(fromRow(result))
     })
 
+    const mergeSandboxes = Effect.fn("Project.mergeSandboxes")(function* (id: ProjectV2.ID, directories: string[]) {
+      if (directories.length === 0) return
+      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get().pipe(Effect.orDie)
+      if (!row) return
+      const sboxes = [...row.sandboxes]
+      let changed = false
+      for (const directory of directories) {
+        const sandbox = AbsolutePath.make(directory)
+        if (!sboxes.includes(sandbox)) {
+          sboxes.push(sandbox)
+          changed = true
+        }
+      }
+      if (!changed) return
+      const result = yield* db
+        .update(ProjectTable)
+        .set({ sandboxes: sboxes, time_updated: Date.now() })
+        .where(eq(ProjectTable.id, id))
+        .returning()
+        .get()
+        .pipe(Effect.orDie)
+      if (!result) return
+      yield* emitUpdated(fromRow(result))
+    })
+
     const removeSandbox = Effect.fn("Project.removeSandbox")(function* (id: ProjectV2.ID, directory: string) {
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get().pipe(Effect.orDie)
       if (!row) throw new Error(`Project not found: ${id}`)
@@ -458,7 +599,9 @@ const layer = Layer.effect(
       setInitialized,
       sandboxes,
       addSandbox,
+      mergeSandboxes,
       removeSandbox,
+      reconcileWorktrees,
     })
   }),
 )
@@ -470,6 +613,7 @@ export const node = LayerNode.make({
   layer: layer,
   deps: [
     FSUtil.node,
+    path,
     AppProcess.node,
     CrossSpawnSpawner.node,
     ProjectV2.node,

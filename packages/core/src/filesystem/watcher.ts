@@ -50,6 +50,22 @@ function protecteds(dir: string) {
 
 export const hasNativeBinding = () => !!watcher()
 
+/**
+ * Low-level subscription primitive using the native watcher binding. Returns
+ * the pending subscription (which the caller is responsible for unsubscribing),
+ * or `undefined` when no native binding is available for this platform.
+ */
+export const watchDirectory = (
+  directory: string,
+  callback: ParcelWatcher.SubscribeCallback,
+  options?: { ignore?: string[] },
+): Promise<ParcelWatcher.AsyncSubscription> | undefined => {
+  const w = watcher()
+  const backend = getBackend()
+  if (!w || !backend) return undefined
+  return w.subscribe(directory, callback, { ignore: options?.ignore, backend })
+}
+
 export interface Interface {}
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/FileWatcher") {}

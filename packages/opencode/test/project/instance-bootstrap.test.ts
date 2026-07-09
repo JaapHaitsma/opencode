@@ -2,10 +2,12 @@ import { afterEach, expect } from "bun:test"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { pathToFileURL } from "node:url"
+import { $ } from "bun"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Cause, Effect, Exit, Fiber } from "effect"
 import { bootstrap as cliBootstrap } from "../../src/cli/bootstrap"
+import { Project } from "../../src/project/project"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { disposeAllInstances, tmpdirScoped } from "../fixture/fixture"
@@ -14,6 +16,12 @@ import { waitGlobalBusEvent } from "../server/global-bus"
 
 const it = testEffect(
   LayerNode.compile(LayerNode.group([InstanceStore.node, CrossSpawnSpawner.node]), [
+    [InstanceStore.bootstrapNode, InstanceBootstrap.node],
+  ]),
+)
+
+const itWithProject = testEffect(
+  LayerNode.compile(LayerNode.group([InstanceStore.node, Project.node, CrossSpawnSpawner.node]), [
     [InstanceStore.bootstrapNode, InstanceBootstrap.node],
   ]),
 )
@@ -111,5 +119,32 @@ it.live("InstanceStore.reload runs InstanceBootstrap", () =>
     yield* store.reload({ directory: tmp.directory })
 
     expect(existsSync(tmp.marker)).toBe(true)
+  }),
+)
+
+itWithProject.live("boot discovers pre-existing worktrees into the project's sandboxes", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped({ git: true })
+    const store = yield* InstanceStore.Service
+    const project = yield* Project.Service
+    const norm = (p: string) => (process.platform === "win32" ? path.resolve(p).toLowerCase() : path.resolve(p))
+
+    const worktreePath = path.join(dir, "..", path.basename(dir) + "-preexisting")
+    yield* Effect.addFinalizer(() =>
+      Effect.promise(() =>
+        $`git worktree remove ${worktreePath}`
+          .cwd(dir)
+          .quiet()
+          .catch(() => {}),
+      ),
+    )
+    yield* Effect.promise(() => $`git worktree add ${worktreePath} -b preexisting-${Date.now()}`.cwd(dir).quiet())
+
+    // Booting the instance runs InstanceBootstrap -> Project.init, which reconciles worktrees.
+    yield* store.provide({ directory: dir }, Effect.void)
+
+    const resolved = yield* project.fromDirectory(dir)
+    const found = yield* project.get(resolved.project.id)
+    expect(found?.sandboxes.map(norm)).toContain(norm(worktreePath))
   }),
 )
