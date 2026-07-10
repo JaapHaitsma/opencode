@@ -10,6 +10,7 @@ import { GlobalBus } from "@/bus/global"
 import { which } from "@opencode-ai/core/util/which"
 import { Command } from "@/command"
 import { InstanceState } from "@/effect/instance-state"
+import { EffectBridge } from "@/effect/bridge"
 import type { InstanceContext } from "@/project/instance-context"
 import { Effect, Layer, Scope, Context, Stream, Types, Schema, Path } from "effect"
 import { path } from "@opencode-ai/core/effect/app-node-platform"
@@ -86,9 +87,11 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Pro
 
 export interface Interface {
   /**
-   * Per-instance setup. Subscribes to the `/init` slash command for the
-   * current instance and stamps the project's initialized timestamp when it
-   * fires. Subscription lifetime is tied to the per-instance state scope.
+   * Per-instance setup. Subscribes to the `/init` slash command (stamping the
+   * project's initialized timestamp when it fires) and, for the main worktree
+   * of a git project, reconciles tracked sandboxes with the worktrees git
+   * reports and watches `.git/worktrees` so worktrees added/removed by any tool
+   * are picked up live. Lifetimes are tied to the per-instance state scope.
    */
   readonly init: () => Effect.Effect<void>
   readonly fromDirectory: (directory: string) => Effect.Effect<{ project: Info; sandbox: string }>
@@ -402,18 +405,18 @@ const layer = Layer.effect(
     })
 
     function parseWorktreePaths(text: string) {
-      const result: string[] = []
-      for (const raw of text.split("\n")) {
-        const line = raw.trim()
-        if (line.startsWith("worktree ")) result.push(line.slice("worktree ".length).trim())
-      }
-      return result
+      return text
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.startsWith("worktree "))
+        .map((line) => line.slice("worktree ".length).trim())
     }
 
     // Merge every git worktree the repo actually has into the project's tracked
     // sandboxes, so worktrees created outside opencode (e.g. on the CLI) show up
     // as workspaces. Takes plain primitives so it can run from a watcher callback
-    // or a boot hook without an ambient instance context.
+    // or a boot hook without an ambient instance context. Paths are stored raw
+    // (matching addSandbox/fromDirectory) but deduped/compared on a canonical key.
     const reconcileWorktrees = Effect.fn("Project.reconcileWorktrees")(function* (input: {
       projectID: ProjectV2.ID
       worktree: string
@@ -422,30 +425,36 @@ const layer = Layer.effect(
       if (input.vcs !== "git") return
       const result = yield* git(["worktree", "list", "--porcelain"], { cwd: input.worktree })
       if (result.code !== 0) return
-      const primary = yield* canonical(input.worktree)
-      const found: string[] = []
-      for (const raw of parseWorktreePaths(result.text)) {
-        const dir = yield* canonical(raw)
-        if (dir !== primary) found.push(dir)
+      const [primary, listed, existing] = yield* Effect.all([
+        canonical(input.worktree),
+        Effect.forEach(parseWorktreePaths(result.text), (raw) => canonical(raw).pipe(Effect.map((key) => ({ raw, key }))), {
+          concurrency: "unbounded",
+        }),
+        sandboxes(input.projectID),
+      ])
+      const seen = new Set(yield* Effect.forEach(existing, (dir) => canonical(dir), { concurrency: "unbounded" }))
+      seen.add(primary)
+      const missing: string[] = []
+      for (const { raw, key } of listed) {
+        if (seen.has(key)) continue
+        seen.add(key)
+        missing.push(raw)
       }
-      if (found.length === 0) return
-      const existing = yield* sandboxes(input.projectID)
-      const seen = new Set<string>()
-      for (const dir of existing) seen.add(yield* canonical(dir))
-      const missing = found.filter((dir) => !seen.has(dir))
       if (missing.length === 0) return
       yield* mergeSandboxes(input.projectID, missing)
     })
 
     // Reconcile once on boot, then watch the repo's `.git/worktrees` directory
     // (git records every worktree there, wherever it lives) so add/remove by any
-    // tool is picked up live. Only the primary worktree instance owns this.
+    // tool is picked up live. Only the main worktree's instance owns this.
     const watchWorktrees = Effect.fn("Project.watchWorktrees")(function* (ctx: InstanceContext) {
       if (ctx.project.vcs !== "git") return
-      const primary = yield* canonical(ctx.project.worktree)
-      if ((yield* canonical(ctx.directory)) !== primary) return
+      // Guard on the resolved worktree root, not ctx.directory (which may be a
+      // subdirectory the user opened): sandbox instances skip, the main one runs.
+      if ((yield* canonical(ctx.worktree)) !== (yield* canonical(ctx.project.worktree))) return
 
       const reconcileArgs = { projectID: ctx.project.id, worktree: ctx.project.worktree, vcs: ctx.project.vcs }
+      // Bounded, fast discovery on the boot path so worktrees appear on load.
       yield* reconcileWorktrees(reconcileArgs).pipe(
         Effect.catchCause((cause) => Effect.logWarning("worktree reconcile failed", { cause })),
       )
@@ -455,42 +464,78 @@ const layer = Layer.effect(
       const commonDir = yield* canonical(pathSvc.resolve(ctx.project.worktree, commonDirResult.text.trim()))
       const worktreesDir = pathSvc.join(commonDir, "worktrees")
 
+      // Watch the git common dir but ignore everything except the `worktrees` folder.
       const entries = yield* fs.readDirectoryEntries(commonDir).pipe(Effect.catch(() => Effect.succeed([])))
       const ignore = entries.flatMap((entry) => (entry.name === "worktrees" ? [] : [entry.name]))
 
-      let timer: ReturnType<typeof setTimeout> | undefined
-      const trigger = () => {
-        if (timer) clearTimeout(timer)
-        timer = setTimeout(() => {
-          timer = undefined
-          Effect.runFork(
-            reconcileWorktrees(reconcileArgs).pipe(
-              Effect.catchCause((cause) => Effect.logWarning("worktree reconcile failed", { cause })),
+      const bridge = yield* EffectBridge.make()
+
+      // Serialize reconciles so overlapping runs can't clobber the sandboxes column.
+      let running = false
+      let again = false
+      const kick = () => {
+        if (running) {
+          again = true
+          return
+        }
+        running = true
+        bridge.fork(
+          reconcileWorktrees(reconcileArgs).pipe(
+            Effect.catchCause((cause) => Effect.logWarning("worktree reconcile failed", { cause })),
+            Effect.ensuring(
+              Effect.sync(() => {
+                running = false
+                if (again) {
+                  again = false
+                  kick()
+                }
+              }),
             ),
-          )
-        }, 200)
+          ),
+        )
       }
 
+      const samePath = (a: string, b: string) =>
+        process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b
+
+      let timer: ReturnType<typeof setTimeout> | undefined
       const callback: ParcelWatcher.SubscribeCallback = (_error, updates) => {
+        // A worktree entry is a direct child dir of `worktrees/`; routine git
+        // activity (commits, checkouts) only touches files deeper inside, so
+        // matching on the direct parent avoids reconciling on every commit.
         for (const update of updates) {
-          if (update.path === worktreesDir || update.path.startsWith(`${worktreesDir}${pathSvc.sep}`)) {
-            trigger()
+          if (samePath(pathSvc.dirname(update.path), worktreesDir)) {
+            if (timer) clearTimeout(timer)
+            timer = setTimeout(() => {
+              timer = undefined
+              kick()
+            }, 200)
             return
           }
         }
       }
 
-      const pending = Watcher.watchDirectory(commonDir, callback, { ignore })
-      if (pending) {
-        const subscription = yield* Effect.promise(() => pending).pipe(Effect.catch(() => Effect.succeed(undefined)))
-        if (subscription)
-          yield* Effect.addFinalizer(() =>
-            Effect.promise(() => subscription.unsubscribe()).pipe(Effect.catch(() => Effect.void)),
-          )
-      }
+      let subscription: ParcelWatcher.AsyncSubscription | undefined
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
           if (timer) clearTimeout(timer)
+        }),
+      )
+      yield* Effect.addFinalizer(() =>
+        subscription
+          ? Effect.promise(() => subscription!.unsubscribe()).pipe(Effect.catch(() => Effect.void))
+          : Effect.void,
+      )
+
+      const pending = Watcher.watchDirectory(commonDir, callback, { ignore })
+      if (!pending) return
+      yield* Effect.promise(() => pending).pipe(
+        Effect.tap((sub) => Effect.sync(() => (subscription = sub))),
+        Effect.timeout(10_000),
+        Effect.catchCause((cause) => {
+          // If subscribe resolves after a timeout/interruption, unsubscribe the orphan.
+          pending.then((sub) => sub.unsubscribe()).catch(() => {})
+          return Effect.logWarning("worktree watch subscribe failed", { cause })
         }),
       )
     })
