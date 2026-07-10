@@ -17,6 +17,7 @@ import { path } from "@opencode-ai/core/effect/app-node-platform"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
+import { Git } from "@opencode-ai/core/git"
 import type ParcelWatcher from "@parcel/watcher"
 import { AppProcess } from "@opencode-ai/core/process"
 import { ProjectV2 } from "@opencode-ai/core/project"
@@ -126,6 +127,7 @@ const layer = Layer.effect(
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const pathSvc = yield* Path.Path
+    const gitCore = yield* Git.Service
     const { db } = yield* Database.Service
 
     const git = Effect.fnUntraced(
@@ -404,44 +406,40 @@ const layer = Layer.effect(
       return process.platform === "win32" ? normalized.toLowerCase() : normalized
     })
 
-    function parseWorktreePaths(text: string) {
-      return text
-        .split("\n")
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith("worktree "))
-        .map((line) => line.slice("worktree ".length).trim())
-    }
+    // Merge the git worktrees under `repo` into the project's tracked sandboxes,
+    // so worktrees created outside opencode (e.g. on the CLI) show up as
+    // workspaces. Paths are stored as git reports them (matching addSandbox /
+    // fromDirectory) but deduped against existing sandboxes on a canonical key.
+    const reconcileFromRepo = Effect.fnUntraced(function* (projectID: ProjectV2.ID, repo: Git.Repository) {
+      const worktrees = yield* gitCore.worktree.list(repo).pipe(Effect.catch(() => Effect.succeed([])))
+      const linked = worktrees.filter((worktree) => worktree.kind === "linked")
+      if (linked.length === 0) return
+      const existing = yield* sandboxes(projectID)
+      const seen = new Set(yield* Effect.forEach(existing, (dir) => canonical(dir), { concurrency: "unbounded" }))
+      const missing: string[] = []
+      for (const worktree of linked) {
+        const key = yield* canonical(worktree.directory)
+        if (seen.has(key)) continue
+        seen.add(key)
+        missing.push(worktree.directory)
+      }
+      if (missing.length === 0) return
+      yield* mergeSandboxes(projectID, missing)
+    })
 
-    // Merge every git worktree the repo actually has into the project's tracked
-    // sandboxes, so worktrees created outside opencode (e.g. on the CLI) show up
-    // as workspaces. Takes plain primitives so it can run from a watcher callback
-    // or a boot hook without an ambient instance context. Paths are stored raw
-    // (matching addSandbox/fromDirectory) but deduped/compared on a canonical key.
+    // Public entry point (boot + tests/manual refresh): resolve the repository for
+    // `worktree`, then reconcile its worktrees into the project's sandboxes.
     const reconcileWorktrees = Effect.fn("Project.reconcileWorktrees")(function* (input: {
       projectID: ProjectV2.ID
       worktree: string
       vcs: Info["vcs"]
     }) {
       if (input.vcs !== "git") return
-      const result = yield* git(["worktree", "list", "--porcelain"], { cwd: input.worktree })
-      if (result.code !== 0) return
-      const [primary, listed, existing] = yield* Effect.all([
-        canonical(input.worktree),
-        Effect.forEach(parseWorktreePaths(result.text), (raw) => canonical(raw).pipe(Effect.map((key) => ({ raw, key }))), {
-          concurrency: "unbounded",
-        }),
-        sandboxes(input.projectID),
-      ])
-      const seen = new Set(yield* Effect.forEach(existing, (dir) => canonical(dir), { concurrency: "unbounded" }))
-      seen.add(primary)
-      const missing: string[] = []
-      for (const { raw, key } of listed) {
-        if (seen.has(key)) continue
-        seen.add(key)
-        missing.push(raw)
-      }
-      if (missing.length === 0) return
-      yield* mergeSandboxes(input.projectID, missing)
+      const repo = yield* gitCore.repo
+        .discover(AbsolutePath.make(input.worktree))
+        .pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (!repo) return
+      yield* reconcileFromRepo(input.projectID, repo)
     })
 
     // Reconcile once on boot, then watch the repo's `.git/worktrees` directory
@@ -449,19 +447,22 @@ const layer = Layer.effect(
     // tool is picked up live. Only the main worktree's instance owns this.
     const watchWorktrees = Effect.fn("Project.watchWorktrees")(function* (ctx: InstanceContext) {
       if (ctx.project.vcs !== "git") return
-      // Guard on the resolved worktree root, not ctx.directory (which may be a
-      // subdirectory the user opened): sandbox instances skip, the main one runs.
-      if ((yield* canonical(ctx.worktree)) !== (yield* canonical(ctx.project.worktree))) return
+      const repo = yield* gitCore.repo
+        .discover(AbsolutePath.make(ctx.worktree))
+        .pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (!repo) return
+      // Only the main worktree owns discovery: its git dir IS the common dir,
+      // whereas a linked worktree has a distinct git dir. This keys off the real
+      // git structure rather than the recorded project.worktree, so it also works
+      // when opencode is launched from a subdirectory.
+      if (repo.gitDirectory !== repo.commonDirectory) return
 
-      const reconcileArgs = { projectID: ctx.project.id, worktree: ctx.project.worktree, vcs: ctx.project.vcs }
       // Bounded, fast discovery on the boot path so worktrees appear on load.
-      yield* reconcileWorktrees(reconcileArgs).pipe(
+      yield* reconcileFromRepo(ctx.project.id, repo).pipe(
         Effect.catchCause((cause) => Effect.logWarning("worktree reconcile failed", { cause })),
       )
 
-      const commonDirResult = yield* git(["rev-parse", "--git-common-dir"], { cwd: ctx.project.worktree })
-      if (commonDirResult.code !== 0) return
-      const commonDir = yield* canonical(pathSvc.resolve(ctx.project.worktree, commonDirResult.text.trim()))
+      const commonDir = yield* canonical(repo.commonDirectory)
       const worktreesDir = pathSvc.join(commonDir, "worktrees")
 
       // Watch the git common dir but ignore everything except the `worktrees` folder.
@@ -480,7 +481,7 @@ const layer = Layer.effect(
         }
         running = true
         bridge.fork(
-          reconcileWorktrees(reconcileArgs).pipe(
+          reconcileFromRepo(ctx.project.id, repo).pipe(
             Effect.catchCause((cause) => Effect.logWarning("worktree reconcile failed", { cause })),
             Effect.ensuring(
               Effect.sync(() => {
@@ -576,20 +577,7 @@ const layer = Layer.effect(
     })
 
     const addSandbox = Effect.fn("Project.addSandbox")(function* (id: ProjectV2.ID, directory: string) {
-      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get().pipe(Effect.orDie)
-      if (!row) throw new Error(`Project not found: ${id}`)
-      const sandbox = AbsolutePath.make(directory)
-      const sboxes = [...row.sandboxes]
-      if (!sboxes.includes(sandbox)) sboxes.push(sandbox)
-      const result = yield* db
-        .update(ProjectTable)
-        .set({ sandboxes: sboxes, time_updated: Date.now() })
-        .where(eq(ProjectTable.id, id))
-        .returning()
-        .get()
-        .pipe(Effect.orDie)
-      if (!result) throw new Error(`Project not found: ${id}`)
-      yield* emitUpdated(fromRow(result))
+      yield* mergeSandboxes(id, [directory])
     })
 
     const mergeSandboxes = Effect.fn("Project.mergeSandboxes")(function* (id: ProjectV2.ID, directories: string[]) {
@@ -665,6 +653,7 @@ export const node = LayerNode.make({
     ProjectDirectories.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
+    Git.node,
     Database.node,
   ],
 })
