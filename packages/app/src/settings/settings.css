@@ -97,6 +97,16 @@
   padding-inline: 24px;
 }
 
+/*
+ * .settings-about centers its content via align-items on the panel. The
+ * ScrollView viewport is a block box, so re-establish the centering there.
+ */
+.settings-about [data-slot="settings-panel-scroll"] > .scroll-view__viewport {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
 .settings-about-content {
   display: flex;
   flex-shrink: 0;
